@@ -1,0 +1,13 @@
+# Python environment (recreate with: bash setup.sh)
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights (setup.sh downloads them)
+models/
+
+# Local session reports and personal gesture recordings
+runs/
+custom_gestures/
+
+.DS_Store
