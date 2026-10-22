@@ -75,14 +75,53 @@ To use a particular Python, run `PY=python3.12 bash setup.sh`.
 
 The models run on the best hardware available: an NVIDIA GPU (`cuda`), then the Apple GPU (`mps`), then the CPU.
 
-### Ubuntu notes
-- `setup.sh` installs the system packages it needs with `sudo apt-get`, so it will ask for your password once:
-  - `libportaudio2`: MediaPipe loads its audio module at startup;
-  - `libgl1` and `libglib2.0-0`: needed for the OpenCV window.
-- On a PC without an NVIDIA GPU, the CPU build of PyTorch is installed (~200 MB instead of ~3 GB).
-- **Camera:** check it exists with `ls /dev/video*`. If it can't be opened, add yourself to the video group with `sudo usermod -aG video $USER`, then log out and back in. Use `--camera 1` for a second camera.
-- **Wayland desktop:** if the window doesn't open, run `QT_QPA_PLATFORM=xcb .venv/bin/python app.py`.
-- **NVIDIA Jetson:** PyTorch from pip runs on the CPU there. For the GPU, install NVIDIA's JetPack PyTorch build first.
+### Running on an Ubuntu machine
+
+**1. Install the basics.** Ubuntu 24.04 already has Python 3.12:
+```bash
+sudo apt update && sudo apt install -y git curl python3 python3-venv
+```
+Ubuntu 22.04 ships Python 3.10, so install 3.12 alongside it:
+```bash
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt install -y python3.12 python3.12-venv
+```
+
+**2. Get the code and set it up:**
+```bash
+git clone https://github.com/AayushNair10/Face-recognition-and-gesture-tracking-YOLO-mediapipe-.git
+cd Face-recognition-and-gesture-tracking-YOLO-mediapipe-
+bash setup.sh                    # on 22.04: PY=python3.12 bash setup.sh
+```
+`setup.sh` asks for your sudo password once to install the system packages it needs:
+- `libportaudio2`: MediaPipe loads its audio module at startup;
+- `libgl1` and `libglib2.0-0`: needed for the OpenCV window.
+
+On a PC without an NVIDIA GPU it installs the CPU build of PyTorch (~200 MB instead of ~3 GB).
+
+**3. Check that everything works (no webcam needed):**
+```bash
+.venv/bin/python smoke_test.py   # should end with: ALL PASSED
+```
+
+**4. Check the camera, then run the app:**
+```bash
+ls /dev/video*                   # should list at least /dev/video0
+.venv/bin/python app.py          # use --camera 1, 2, ... if video0 isn't your webcam
+```
+Run it from the Ubuntu desktop, because it opens a window. Over SSH, use `ssh -X` so the window shows on your own machine.
+
+**Troubleshooting**
+
+| Problem | Fix |
+|---|---|
+| `Could not read from camera` | Try another index (`--camera 1`). Add yourself to the video group with `sudo usermod -aG video $USER`, then log out and back in. Close other apps that are using the camera. |
+| `PortAudio library not found` | `sudo apt install libportaudio2` |
+| `libGL.so.1` / `libgthread` errors | `sudo apt install libgl1 libglib2.0-0` |
+| Window doesn't open (Wayland desktop) | `QT_QPA_PLATFORM=xcb .venv/bin/python app.py` |
+| `could not connect to display` | You're over SSH without a display: reconnect with `ssh -X`, or run it on the machine's desktop |
+| Low FPS on a CPU-only PC | `--gesture-every 3` and/or `--redetect 20` |
+| NVIDIA Jetson runs on CPU | PyTorch from pip has no Jetson GPU support. Install NVIDIA's JetPack PyTorch build first. |
 
 Every push is automatically tested on Ubuntu 22.04, Ubuntu 24.04 and Ubuntu 24.04 ARM through GitHub Actions (`.github/workflows/ubuntu.yml`).
 
