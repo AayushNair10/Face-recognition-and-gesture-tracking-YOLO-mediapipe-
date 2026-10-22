@@ -16,8 +16,9 @@ PYV=$("$PY" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}"
 echo "using $PY (Python $PYV) on $OS $(uname -m)"
 
 if [ "$OS" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then
-  # portaudio: mediapipe imports sounddevice at startup | libgl/glib/xcb: OpenCV window
-  DEPS="libportaudio2 libgl1 libglib2.0-0 libxcb-xinerama0 libxkbcommon-x11-0 curl"
+  # portaudio: mediapipe imports sounddevice at startup | egl/gles: mediapipe's native library
+  # libgl/glib/xcb: OpenCV window
+  DEPS="libportaudio2 libegl1 libgles2 libgl1 libglib2.0-0 libxcb-xinerama0 libxkbcommon-x11-0 curl"
   "$PY" -c "import ensurepip" 2>/dev/null || DEPS="$DEPS python$PYV-venv"  # Ubuntu's Python ships without venv
   # (Ubuntu 24.04 renamed some libraries to <name>t64)
   MISSING=$(for p in $DEPS; do dpkg -s "$p" >/dev/null 2>&1 || dpkg -s "${p}t64" >/dev/null 2>&1 || echo "$p"; done | xargs)

@@ -95,6 +95,7 @@ bash setup.sh                    # on 22.04: PY=python3.12 bash setup.sh
 ```
 `setup.sh` asks for your sudo password once to install the system packages it needs:
 - `libportaudio2`: MediaPipe loads its audio module at startup;
+- `libegl1` and `libgles2`: MediaPipe's native library needs OpenGL;
 - `libgl1` and `libglib2.0-0`: needed for the OpenCV window.
 
 On a PC without an NVIDIA GPU it installs the CPU build of PyTorch (~200 MB instead of ~3 GB).
@@ -117,6 +118,7 @@ Run it from the Ubuntu desktop, because it opens a window. Over SSH, use `ssh -X
 |---|---|
 | `Could not read from camera` | Try another index (`--camera 1`). Add yourself to the video group with `sudo usermod -aG video $USER`, then log out and back in. Close other apps that are using the camera. |
 | `PortAudio library not found` | `sudo apt install libportaudio2` |
+| `libEGL.so.1` / `libGLESv2.so.2` not found | `sudo apt install libegl1 libgles2` |
 | `libGL.so.1` / `libgthread` errors | `sudo apt install libgl1 libglib2.0-0` |
 | Window doesn't open (Wayland desktop) | `QT_QPA_PLATFORM=xcb .venv/bin/python app.py` |
 | `could not connect to display` | You're over SSH without a display: reconnect with `ssh -X`, or run it on the machine's desktop |
