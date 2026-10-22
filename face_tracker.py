@@ -60,6 +60,16 @@ def head_box_from_pose(kpts, kconf, person_box, kp_thr=0.5):
     return [cx - s / 2, cy - 0.575 * s, cx + s / 2, cy + 0.575 * s]
 
 
+def pick_device():
+    """NVIDIA GPU (Ubuntu / Jetson) > Apple GPU (Mac) > CPU."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 @dataclass
 class HeadResult:
     head_box: list | None        # xyxy pixels
@@ -73,10 +83,9 @@ class HeadResult:
 
 class HeadTracker:
     def __init__(self, pose_weights, vit_weights, redetect=15, min_score=0.3, conf=0.25, imgsz=640, device=None):
-        import torch
         from ultralytics import YOLO
 
-        self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = device or pick_device()
         self.model = YOLO(pose_weights, task="pose")
         params = cv2.TrackerVit_Params()
         params.net = vit_weights

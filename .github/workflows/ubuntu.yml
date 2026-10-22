@@ -1,0 +1,26 @@
+# Checks the project installs and runs on fresh Ubuntu machines (PC and ARM, like a robot board).
+# No webcam in CI: smoke_test.py runs the models on sample photos instead.
+name: Ubuntu check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Setup (system packages, venv, models)
+        run: PY=python bash setup.sh
+      - name: Smoke test
+        run: .venv/bin/python smoke_test.py

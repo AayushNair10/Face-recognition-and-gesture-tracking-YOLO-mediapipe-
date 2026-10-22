@@ -8,6 +8,7 @@ A report table is written to runs/<timestamp>/summary.md (+ frames.csv, events.c
 `.venv/bin/python report.py` compares all runs side by side in runs/all_runs.md.
 """
 import argparse
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -98,7 +99,10 @@ def draw(frame, head, hands, stats, args, show_hud, banner, rec_info):
 
 
 def open_camera(idx, width, height):
-    cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+    backend = {"darwin": cv2.CAP_AVFOUNDATION, "linux": cv2.CAP_V4L2}.get(sys.platform, cv2.CAP_ANY)
+    cap = cv2.VideoCapture(idx, backend)
+    if sys.platform == "linux":  # most USB webcams only reach 30 FPS at 720p in MJPG mode
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     for _ in range(50):  # the first reads can fail while the camera wakes up
@@ -106,8 +110,12 @@ def open_camera(idx, width, height):
         if ok:
             return cap
         time.sleep(0.05)
-    raise SystemExit("Could not read from the camera. On macOS allow camera access for Terminal / VS Code in "
-                     "System Settings > Privacy & Security > Camera, then run again.")
+    hint = {
+        "darwin": "On macOS allow camera access for Terminal / VS Code in System Settings > Privacy & Security > Camera.",
+        "linux": f"On Ubuntu check the camera exists (ls /dev/video*), try another --camera index, and make sure your "
+                 f"user is in the 'video' group (sudo usermod -aG video $USER, then log out and in).",
+    }.get(sys.platform, "Check the camera is connected and not used by another app.")
+    raise SystemExit(f"Could not read from camera {idx}. {hint}")
 
 
 def main():
@@ -121,7 +129,7 @@ def main():
                     help="MediaPipe .task (built-in, or one trained with Model Maker)")
     ap.add_argument("--record", metavar="LABEL", help="record samples for a custom gesture (press c to start/stop)")
     ap.add_argument("--no-gestures", action="store_true")
-    ap.add_argument("--device", default=None, help="mps / cpu (default: mps if available)")
+    ap.add_argument("--device", default=None, help="cuda / mps / cpu (default: best available)")
     args = ap.parse_args()
 
     print("loading models ...")

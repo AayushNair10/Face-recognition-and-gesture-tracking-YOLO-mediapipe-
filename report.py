@@ -99,7 +99,7 @@ def _mark(check, s):
 def run_table(name, s, config):
     setup = ", ".join(f"{k}={v}" for k, v in config.items() if k != "custom_labels")
     L = [f"# Session report: {name}", "",
-         f"Setup: {platform.machine()} Mac, {psutil.virtual_memory().total / 2**30:.0f} GB RAM, {setup}", "",
+         f"Setup: {platform.system()} {platform.machine()}, {psutil.virtual_memory().total / 2**30:.0f} GB RAM, {setup}", "",
          "| Metric | Result | Good if | Status |", "|---|---|---|---|"]
     L += [f"| {lbl} | {fmt(s)} | {good} | {_mark(chk, s)} |" for lbl, fmt, good, chk in ROWS]
     L += ["", "Lag does not include the webcam's own delay (not measurable in software, typically 30-60 ms).", ""]

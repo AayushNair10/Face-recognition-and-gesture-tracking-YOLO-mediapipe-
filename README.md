@@ -62,17 +62,31 @@ Displayed FPS also depends on the webcam. MacBook cameras drop to about 19 FPS i
 
 ## Setup
 
-Requires macOS on Apple silicon (other platforms work on CPU) and Python 3.13.
+Works on **macOS (Apple silicon)** and **Ubuntu 22.04 / 24.04** (x86_64 PCs and ARM boards), with Python 3.12 or 3.13.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/assistive-face-gesture.git
-cd assistive-face-gesture
-bash setup.sh            # creates .venv, installs packages, downloads the 3 model files
+git clone https://github.com/AayushNair10/Face-recognition-and-gesture-tracking-YOLO-mediapipe-.git
+cd Face-recognition-and-gesture-tracking-YOLO-mediapipe-
+bash setup.sh                    # venv, packages, the 3 model files (+ system packages on Ubuntu)
+.venv/bin/python smoke_test.py   # checks everything works, no webcam needed
 ```
 
-If your Python 3.13 is somewhere else, run `PY=python3.13 bash setup.sh`.
+To use a particular Python, run `PY=python3.12 bash setup.sh`.
 
-On the first run, macOS asks for camera permission for your terminal or VS Code.
+The models run on the best hardware available: an NVIDIA GPU (`cuda`), then the Apple GPU (`mps`), then the CPU.
+
+### Ubuntu notes
+- `setup.sh` installs the system packages it needs with `sudo apt-get`, so it will ask for your password once:
+  - `libportaudio2`: MediaPipe loads its audio module at startup;
+  - `libgl1` and `libglib2.0-0`: needed for the OpenCV window.
+- On a PC without an NVIDIA GPU, the CPU build of PyTorch is installed (~200 MB instead of ~3 GB).
+- **Camera:** check it exists with `ls /dev/video*`. If it can't be opened, add yourself to the video group with `sudo usermod -aG video $USER`, then log out and back in. Use `--camera 1` for a second camera.
+- **Wayland desktop:** if the window doesn't open, run `QT_QPA_PLATFORM=xcb .venv/bin/python app.py`.
+- **NVIDIA Jetson:** PyTorch from pip runs on the CPU there. For the GPU, install NVIDIA's JetPack PyTorch build first.
+
+Every push is automatically tested on Ubuntu 22.04, Ubuntu 24.04 and Ubuntu 24.04 ARM through GitHub Actions (`.github/workflows/ubuntu.yml`).
+
+On macOS, the first run asks for camera permission for your terminal or VS Code.
 
 ## Usage
 
@@ -91,7 +105,7 @@ Useful options:
 ```bash
 .venv/bin/python app.py --redetect 10       # correct the tracker more often (less drift, a bit slower)
 .venv/bin/python app.py --gesture-every 1   # check gestures every frame (more responsive, more load)
-.venv/bin/python app.py --device cpu        # run without Apple GPU
+.venv/bin/python app.py --device cpu        # force CPU only (no GPU)
 .venv/bin/python app.py --help              # all options
 ```
 
@@ -125,6 +139,7 @@ face_tracker.py   YOLO26n-pose + ViT hybrid face tracker
 gestures.py       MediaPipe gestures, custom k-NN gestures, owner filter, debouncer
 metrics.py        live stats for the overlay
 report.py         session report tables
+smoke_test.py     headless self-check (used by the Ubuntu CI)
 setup.sh          one-time environment + model download
 requirements.txt  pinned package versions
 ```
