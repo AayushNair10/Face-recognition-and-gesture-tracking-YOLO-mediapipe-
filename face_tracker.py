@@ -3,16 +3,23 @@
 Same hybrid as the `sot-vit` setup in ~/Downloads/benchmark_face/bench_person_tracking.py, but the
 detector step builds a *head* box from the pose keypoints (nose / eyes / ears) instead of using the body box.
 """
+from __future__ import annotations
+
+import os
 import time
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
+# The robot has no internet: stop Ultralytics looking for it (set before ultralytics is first imported)
+os.environ.setdefault("YOLO_OFFLINE", "true")
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+
 cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # OpenCV 5 DNN prints a harmless warning per net
 
-# COCO keypoint ids
-NOSE, L_EYE, R_EYE, L_EAR, R_EAR, L_SHO, R_SHO = range(7)
+# COCO keypoint ids (0-4 are the head: nose, eyes, ears)
+L_EAR, R_EAR, L_SHO, R_SHO = 3, 4, 5, 6
 
 
 def iou(a, b):
@@ -78,11 +85,11 @@ class HeadResult:
     state: str                   # "detect" | "track" | "lost"
     pose_ms: float
     vit_ms: float
-    redetect_iou: float | None   # drift check on detect frames (1.0 = ViT was spot on)
 
 
 class HeadTracker:
-    def __init__(self, pose_weights, vit_weights, redetect=15, min_score=0.3, conf=0.25, imgsz=640, device=None):
+    def __init__(self, pose_weights, vit_weights, redetect=15, min_score=0.3, conf=0.25, imgsz=416, device=None,
+                 search_every=5):
         from ultralytics import YOLO
 
         self.device = device or pick_device()
@@ -90,18 +97,24 @@ class HeadTracker:
         params = cv2.TrackerVit_Params()
         params.net = vit_weights
         self.vit = cv2.TrackerVit_create(params)  # created once, re-initialised on every detection
-        self.redetect, self.min_score, self.conf, self.imgsz = redetect, min_score, conf, imgsz
+        self.redetect, self.min_score = redetect, min_score
+        self.search_every = search_every  # nobody in view: look every N frames instead of every frame (saves power)
+        self._search_wait = 0
+        self.predict_args = dict(imgsz=imgsz, conf=conf, device=self.device, max_det=5, verbose=False)
+        if self.device == "cuda":
+            self.predict_args["quantize"] = 16  # 16-bit floats: faster on NVIDIA GPUs, same accuracy
         self.sot = None
         self.since_det = 10**9
         self.head_box = self.person_box = None
         self._head_at_det = None
-        self.model.predict(np.zeros((360, 640, 3), np.uint8), imgsz=imgsz, device=self.device, verbose=False)  # warm-up
+        self.model.predict(np.zeros((360, 640, 3), np.uint8), **self.predict_args)  # warm-up
 
     def force_redetect(self):
         self.since_det = 10**9
+        self._search_wait = 0
 
     def _detect(self, frame):
-        r = self.model.predict(frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False)[0]
+        r = self.model.predict(frame, **self.predict_args)[0]
         if r.keypoints is None or len(r.boxes) == 0:
             return None, None
         boxes = r.boxes.xyxy.cpu().numpy()
@@ -115,7 +128,7 @@ class HeadTracker:
     def update(self, frame):
         h, w = frame.shape[:2]
         pose_ms = vit_ms = 0.0
-        box, state, redet_iou = None, "lost", None
+        box, state = None, "lost"
 
         if self.sot is not None and self.since_det < self.redetect:
             t = time.perf_counter()
@@ -126,14 +139,14 @@ class HeadTracker:
                 box, state = [x, y, x + bw, y + bh], "track"
                 self.since_det += 1
 
-        if box is None:  # (re)detect
+        if box is None and self.sot is None and self._search_wait > 0:
+            self._search_wait -= 1  # nobody in view: skip this frame
+        elif box is None:  # (re)detect
             t = time.perf_counter()
             head, person = self._detect(frame)
             pose_ms = (time.perf_counter() - t) * 1000
             if head is not None:
                 head = clip_box(head, w, h)
-                if self.head_box is not None and self.sot is not None:
-                    redet_iou = iou(head, self.head_box)
                 x1, y1, x2, y2 = head
                 self.sot = self.vit
                 self.sot.init(frame, (int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
@@ -142,6 +155,7 @@ class HeadTracker:
                 box, state = head, "detect"
             else:
                 self.sot, self.person_box = None, None
+                self._search_wait = self.search_every - 1
 
         self.head_box = box
         person = self.person_box
@@ -154,4 +168,4 @@ class HeadTracker:
         if box is not None:
             cx, cy = center(box)
             norm = (2 * cx / w - 1, 2 * cy / h - 1)
-        return HeadResult(box, person, norm, state, pose_ms, vit_ms, redet_iou)
+        return HeadResult(box, person, norm, state, pose_ms, vit_ms)

@@ -4,10 +4,13 @@ Custom gestures reuse MediaPipe's hand-landmark model (stage 1) and only swap th
 samples recorded with `app.py --record LABEL` go to custom_gestures/samples.csv and are matched with k-NN.
 A Model Maker .task file trained in Colab can be dropped in instead with `app.py --gesture-model PATH`.
 """
+from __future__ import annotations
+
 import csv
+import threading
 import time
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -60,40 +63,48 @@ class CustomGestures:
         self.reload()
 
     def reload(self):
-        self.X, self.y = np.zeros((0, 42)), np.array([])
+        X, y = np.zeros((0, 42), np.float32), np.array([])
         if self.path.exists():
             with open(self.path) as f:
                 rows = [r for r in csv.reader(f) if r]
             if rows:
-                self.y = np.array([r[0] for r in rows])
-                self.X = np.array([[float(v) for v in r[1:]] for r in rows])
-        self.threshold = self._fit_threshold()
+                y = np.array([r[0] for r in rows])
+                X = np.array([[float(v) for v in r[1:]] for r in rows], np.float32)
+        self._data = (X, y, self._fit_threshold(X, y))  # swapped in one step: the gesture thread may be reading it
 
-    def _fit_threshold(self):
-        if len(self.X) < 2:
+    @staticmethod
+    def _fit_threshold(X, y):
+        if len(X) < 2:
             return 0.0
-        d = np.linalg.norm(self.X[:, None] - self.X[None], axis=2)
-        np.fill_diagonal(d, np.inf)
-        same = self.y[:, None] == self.y[None]
-        nn = np.where(same, d, np.inf).min(axis=1)
-        nn = nn[np.isfinite(nn)]
-        return max(1.0, 3.0 * float(np.median(nn))) if len(nn) else 1.0
+        nn = []  # distance from each sample to its closest neighbour of the same gesture
+        for label in set(y.tolist()):
+            same = X[y == label]
+            for i in range(len(same) if len(same) > 1 else 0):
+                d = np.linalg.norm(same - same[i], axis=1)
+                d[i] = np.inf
+                nn.append(d.min())
+        return max(1.0, 3.0 * float(np.median(nn))) if nn else 1.0
+
+    @property
+    def threshold(self):
+        return self._data[2]
 
     @property
     def labels(self):
-        return sorted(set(self.y.tolist()))
+        return sorted(set(self._data[1].tolist()))
 
     def __len__(self):
-        return len(self.y)
+        return len(self._data[1])
 
     def predict(self, vec):
-        if len(self.y) < self.k:
+        X, y, threshold = self._data
+        if len(y) < self.k:
             return None, 0.0
-        d = np.linalg.norm(self.X - vec, axis=1)
-        idx = np.argsort(d)[: self.k]
-        label, votes = Counter(self.y[idx].tolist()).most_common(1)[0]
-        dist = np.mean([d[i] for i in idx if self.y[i] == label])
-        if votes < (self.k // 2 + 1) or dist > self.threshold:
+        d = np.linalg.norm(X - vec.astype(np.float32), axis=1)
+        idx = np.argpartition(d, self.k - 1)[: self.k]
+        label, votes = Counter(y[idx].tolist()).most_common(1)[0]
+        dist = np.mean([d[i] for i in idx if y[i] == label])
+        if votes < (self.k // 2 + 1) or dist > threshold:
             return None, 0.0
         return label, votes / self.k
 
@@ -113,10 +124,18 @@ class GestureDetector:
         self.min_score, self.infer_width = min_score, infer_width
         self._last_ts = -1
 
-    def process(self, frame_bgr, person_box=None):
+    def prepare(self, frame_bgr):
+        """Small RGB copy of the frame for MediaPipe (always a new image, so the caller can keep drawing on theirs)."""
         h, w = frame_bgr.shape[:2]
         small = cv2.resize(frame_bgr, (self.infer_width, int(h * self.infer_width / w))) if w > self.infer_width else frame_bgr
-        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+    def process(self, frame_bgr, person_box=None):
+        h, w = frame_bgr.shape[:2]
+        return self.detect(self.prepare(frame_bgr), w, h, person_box)
+
+    def detect(self, rgb, w, h, person_box=None):
+        """Runs the model. w, h: size of the full frame the landmarks are mapped back to."""
         ts = max(int(time.monotonic() * 1000), self._last_ts + 1)  # VIDEO mode needs strictly increasing timestamps
         self._last_ts = ts
         res = self.rec.recognize_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
@@ -135,6 +154,59 @@ class GestureDetector:
 
     def close(self):
         self.rec.close()
+
+
+class GestureWorker:
+    """Runs gesture recognition on its own thread, so the slowest model never delays face tracking."""
+
+    def __init__(self, detector):
+        self.detector = detector
+        self._job, self._result, self._error, self._stop = None, None, None, False
+        self._cond = threading.Condition()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @property
+    def busy(self):
+        return self._job is not None
+
+    def submit(self, frame_bgr, person_box):
+        h, w = frame_bgr.shape[:2]
+        job = (self.detector.prepare(frame_bgr), w, h, person_box)
+        with self._cond:
+            self._job = job
+            self._cond.notify()
+
+    def poll(self):
+        """(hands, milliseconds) when a result is ready, else None."""
+        with self._cond:
+            if self._error:
+                raise self._error
+            result, self._result = self._result, None
+        return result
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while self._job is None and not self._stop:
+                    self._cond.wait()
+                if self._stop:
+                    return
+                job = self._job
+            t = time.perf_counter()
+            try:
+                result, error = (self.detector.detect(*job), (time.perf_counter() - t) * 1000), None
+            except Exception as e:  # handed to the main thread by poll()
+                result, error = None, e
+            with self._cond:
+                self._result, self._error, self._job = result, error, None
+
+    def close(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify()
+        self._thread.join(timeout=2.0)
+        self.detector.close()
 
 
 def _inside(pt, box, grow_x=0.5, grow_up=0.5):

@@ -1,0 +1,5 @@
+# Same as requirements.txt minus torch/torchvision: on a Jetson, setup.sh installs the GPU builds for your JetPack first
+ultralytics==8.4.174
+mediapipe==1.1.1
+opencv-contrib-python==5.0.0.93
+numpy

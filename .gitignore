@@ -6,8 +6,7 @@ __pycache__/
 # Model weights (setup.sh downloads them)
 models/
 
-# Local session reports and personal gesture recordings
-runs/
+# Personal gesture recordings
 custom_gestures/
 
 .DS_Store

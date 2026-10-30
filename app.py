@@ -1,22 +1,22 @@
 """Live test: face tracking (YOLO26n-pose + ViT hybrid) + hand gestures (MediaPipe), with performance analysis.
 
-  .venv/bin/python app.py                      # run
+  .venv/bin/python app.py                      # run with a window
+  .venv/bin/python app.py --headless           # run on the robot: no window, nothing saved
   .venv/bin/python app.py --record wave_help   # record a custom gesture: press c to start/stop recording
 
 Keys: q / Esc quit | r force face re-detect | d toggle HUD | c start/stop recording (with --record)
-A report table is written to runs/<timestamp>/summary.md (+ frames.csv, events.csv) when you quit.
-`.venv/bin/python report.py` compares all runs side by side in runs/all_runs.md.
 """
 import argparse
-import sys
+import signal
+import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 import cv2
 
+from camera import FrameSource
 from face_tracker import HeadTracker
-from gestures import HAND_CONNECTIONS, Debouncer, GestureDetector, normalize_landmarks
+from gestures import HAND_CONNECTIONS, Debouncer, GestureDetector, GestureWorker, normalize_landmarks
 from metrics import Metrics
 
 ROOT = Path(__file__).parent
@@ -75,12 +75,10 @@ def draw(frame, head, hands, stats, args, show_hud, banner, rec_info):
 
     if show_hud:
         s = stats
-        iou = "n/a" if s["redetect_iou"] != s["redetect_iou"] else f"{s['redetect_iou']:.2f}"
         norm = f"x {head.head_center_norm[0]:+.2f}, y {head.head_center_norm[1]:+.2f}" if head.head_center_norm else "-"
         lines = [
             (f"FPS {s['fps']:d}   processing {s['proc_ms']:.1f} ms (p95 {s['proc_p95']:.1f})   lag {s['lag_ms']:.1f} ms (p95 {s['lag_p95']:.1f})", WHITE),
-            (f"pose {s['pose_ms']:.1f} ms | ViT {s['vit_ms']:.1f} ms | gesture {s['gesture_ms']:.1f} ms (every {args.gesture_every}) | draw {s['draw_ms']:.1f} ms", WHITE),
-            (f"detector on {s['det_pct']:.0f}% of frames | re-detect IoU {iou} | CPU {s['cpu']:.0f}% | RAM {s['ram_mb']:.0f} MB", WHITE),
+            (f"pose {s['pose_ms']:.1f} ms | ViT {s['vit_ms']:.1f} ms | gesture {s['gesture_ms']:.1f} ms | detector on {s['det_pct']:.0f}% of frames", WHITE),
             (f"face: {head.state}   centre offset {norm}", GREEN if head.state != "lost" else RED),
         ]
         if rec_info:
@@ -98,103 +96,107 @@ def draw(frame, head, hands, stats, args, show_hud, banner, rec_info):
         text(frame, msg, (x, y), scale, YELLOW, 3)
 
 
-def open_camera(idx, width, height):
-    backend = {"darwin": cv2.CAP_AVFOUNDATION, "linux": cv2.CAP_V4L2}.get(sys.platform, cv2.CAP_ANY)
-    cap = cv2.VideoCapture(idx, backend)
-    if sys.platform == "linux":  # most USB webcams only reach 30 FPS at 720p in MJPG mode
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    for _ in range(50):  # the first reads can fail while the camera wakes up
-        ok, _ = cap.read()
-        if ok:
-            return cap
-        time.sleep(0.05)
-    hint = {
-        "darwin": "On macOS allow camera access for Terminal / VS Code in System Settings > Privacy & Security > Camera.",
-        "linux": f"On Ubuntu check the camera exists (ls /dev/video*), try another --camera index, and make sure your "
-                 f"user is in the 'video' group (sudo usermod -aG video $USER, then log out and in).",
-    }.get(sys.platform, "Check the camera is connected and not used by another app.")
-    raise SystemExit(f"Could not read from camera {idx}. {hint}")
+def on_result(head, events):
+    """Robot hook, called once per frame.
+
+    head.state             "detect" / "track" = person in view, "lost" = nobody
+    head.head_center_norm  where the face is: (x, y), each -1..1 from the image centre (use it to turn the head)
+    events                 gestures that just fired (each has .label and .side)
+    """
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", type=int, default=0)
-    ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--source", help="video file to use instead of the camera (for repeatable tests)")
+    ap.add_argument("--headless", action="store_true", help="robot mode: no window, 640x480 capture")
+    ap.add_argument("--width", type=int, help="capture width (default 1280, or 640 with --headless)")
+    ap.add_argument("--height", type=int, help="capture height (default 720, or 480 with --headless)")
+    ap.add_argument("--imgsz", type=int, default=416, help="YOLO input size (lower = faster, shorter range)")
     ap.add_argument("--redetect", type=int, default=15, help="re-run the pose detector every N frames")
     ap.add_argument("--gesture-every", type=int, default=2, help="run gesture recognition every N frames")
+    ap.add_argument("--pose-model", default=str(MODELS / "yolo26n-pose.pt"), help=".pt, or a TensorRT .engine on Jetson")
     ap.add_argument("--gesture-model", default=str(MODELS / "gesture_recognizer.task"),
                     help="MediaPipe .task (built-in, or one trained with Model Maker)")
     ap.add_argument("--record", metavar="LABEL", help="record samples for a custom gesture (press c to start/stop)")
     ap.add_argument("--no-gestures", action="store_true")
     ap.add_argument("--device", default=None, help="cuda / mps / cpu (default: best available)")
     args = ap.parse_args()
+    if args.headless and args.record:
+        ap.error("--record needs the window (it uses the c key), so it can't be used with --headless")
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
 
     print("loading models ...")
-    tracker = HeadTracker(str(MODELS / "yolo26n-pose.pt"), str(MODELS / "object_tracking_vittrack_2023sep.onnx"),
-                          redetect=args.redetect, device=args.device)
+    tracker = HeadTracker(args.pose_model, str(MODELS / "object_tracking_vittrack_2023sep.onnx"),
+                          redetect=args.redetect, imgsz=args.imgsz, device=args.device)
     gd = None if args.no_gestures else GestureDetector(args.gesture_model, CUSTOM)
+    worker = GestureWorker(gd) if gd else None
     if gd and len(gd.custom):
         print(f"custom gestures loaded: {gd.custom.labels} ({len(gd.custom)} samples)")
     deb, metrics = Debouncer(), Metrics()
-    cap = open_camera(args.camera, args.width, args.height)
-    print(f"camera {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}, "
-          f"device {tracker.device}. Press q to quit.")
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    width = args.width or (640 if args.headless else 1280)
+    height = args.height or (480 if args.headless else 720)
+    src = FrameSource(args.source or args.camera, width, height)
+    print(f"source {src.size[0]}x{src.size[1]}, device {tracker.device}. " + ("Ctrl+C to stop." if args.headless else "Press q to quit."))
+    if not args.headless:
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 
-    hands, banner, show_hud, recording, n_rec, i = [], None, True, False, 0, 0
-    since_g = args.gesture_every
+    hands, banner, show_hud, recording, n_rec = [], None, True, False, 0
+    since_g, stats, t_stats = args.gesture_every, metrics.live(), 0.0
     try:
-        while True:
-            t_r = time.perf_counter()
-            ok, frame = cap.read()
-            t_cap = time.perf_counter()
-            if not ok:
-                print("camera read failed")
+        while not stop.is_set():
+            frame, t_cap = src.read()
+            t_start = time.perf_counter()
+            if frame is None:
+                print("end of video" if src.is_file else "camera stopped")
                 break
             frame = cv2.flip(frame, 1)  # selfie view; also what MediaPipe's handedness assumes
 
             head = tracker.update(frame)
 
-            # gestures every N frames, nudged by one frame when it would land on a pose re-detect (avoids lag spikes)
-            since_g += 1
-            g_ms, g_run = 0.0, bool(gd) and since_g >= args.gesture_every and (head.state != "detect" or since_g > args.gesture_every)
-            if g_run:
-                since_g = 0
-                t = time.perf_counter()
-                hands = gd.process(frame, head.person_box)
-                g_ms = (time.perf_counter() - t) * 1000
-                for ev in deb.update(hands, time.perf_counter()):
-                    metrics.add_event(ev)
-                    banner = (ev, time.perf_counter())
-                    print(f"[{time.perf_counter() - metrics.t0:7.2f}s] GESTURE {ev.label} ({ev.side} hand, {ev.source})")
-                if recording:
-                    own = [hd for hd in hands if hd.owned] or hands
-                    if own:
-                        gd.custom.add(args.record, normalize_landmarks(own[0].landmarks_px, own[0].side))
-                        n_rec += 1
+            g_ms, events = 0.0, []
+            if worker:
+                done = worker.poll()
+                if done:
+                    hands, g_ms = done
+                    events = deb.update(hands, time.perf_counter())
+                    for ev in events:
+                        banner = (ev, time.perf_counter())
+                        print(f"GESTURE {ev.label} ({ev.side} hand, {ev.source})")
+                    if recording:
+                        own = [hd for hd in hands if hd.owned] or hands
+                        if own:
+                            gd.custom.add(args.record, normalize_landmarks(own[0].landmarks_px, own[0].side))
+                            n_rec += 1
+                since_g += 1
+                if head.person_box is None and not args.record:  # nobody to take gestures from: save the work
+                    hands = []
+                    deb.update([], time.perf_counter())
+                elif since_g >= args.gesture_every and not worker.busy:
+                    worker.submit(frame, head.person_box)
+                    since_g = 0
+
+            on_result(head, events)
+            if args.headless:
+                continue
 
             t_d = time.perf_counter()
+            if t_d - t_stats > 0.5:  # the panel only changes twice a second
+                stats, t_stats = metrics.live(), t_d
             rec_info = None
             if args.record:
                 rec_info = (f"RECORDING '{args.record}': {n_rec} samples (c to stop)", RED) if recording else \
                            (f"custom gesture '{args.record}': {n_rec} new samples - press c to record", YELLOW)
-            draw(frame, head, hands, metrics.live(), args, show_hud, banner, rec_info)
-            draw_ms = (time.perf_counter() - t_d) * 1000
-            proc_ms = (time.perf_counter() - t_cap) * 1000
-
+            draw(frame, head, hands, stats, args, show_hud, banner, rec_info)
+            proc_ms = (time.perf_counter() - t_start) * 1000
             cv2.imshow(WIN, frame)
             key = cv2.waitKey(1) & 0xFF
-            lag_ms = (time.perf_counter() - t_cap) * 1000
 
-            metrics.add_frame({
-                "frame": i, "state": head.state, "read_ms": round((t_cap - t_r) * 1000, 2),
-                "pose_ms": round(head.pose_ms, 2), "vit_ms": round(head.vit_ms, 2), "gesture_ms": round(g_ms, 2),
-                "draw_ms": round(draw_ms, 2), "proc_ms": round(proc_ms, 2), "lag_ms": round(lag_ms, 2),
-                "gesture_run": int(g_run), "hands": len(hands),
-                "redetect_iou": None if head.redetect_iou is None else round(head.redetect_iou, 3)})
+            metrics.add_frame({"state": head.state, "pose_ms": head.pose_ms, "vit_ms": head.vit_ms, "gesture_ms": g_ms,
+                               "proc_ms": proc_ms, "lag_ms": (time.perf_counter() - t_cap) * 1000})
 
             if key in (ord("q"), 27) or cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
                 break
@@ -207,18 +209,12 @@ def main():
                 if not recording:
                     gd.custom.reload()
                     print(f"saved {n_rec} samples for '{args.record}' -> {CUSTOM}; now recognising {gd.custom.labels}")
-            i += 1
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        if gd:
-            gd.close()
-        run_dir = ROOT / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")
-        cfg = {"device": tracker.device, "redetect": args.redetect, "gesture_every": args.gesture_every,
-               "camera": f"{args.width}x{args.height}", "gesture_model": Path(args.gesture_model).name,
-               "custom_labels": gd.custom.labels if gd else []}
-        print("\n" + metrics.write_report(run_dir, cfg))
-        print(f"report saved to {run_dir}/")
+        src.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
+        if worker:
+            worker.close()
 
 
 if __name__ == "__main__":

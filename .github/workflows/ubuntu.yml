@@ -22,5 +22,5 @@ jobs:
           cache: pip
       - name: Setup (system packages, venv, models)
         run: PY=python bash setup.sh
-      - name: Smoke test
-        run: .venv/bin/python smoke_test.py
+      - name: Smoke test with no network (like the robot)
+        run: sudo unshare --net sudo -u "$USER" .venv/bin/python smoke_test.py
